@@ -11,6 +11,8 @@
 //   it is recommended to use the built-in Serial interface for full speed perfomace.
 // • The data packaging includes a Start Frame, checksum, and re-syncronization capability for reliable communication
 // 
+// The code starts with zero speed and moves towards +
+//
 // CONFIGURATION on the hoverboard side in config.h:
 // • Option 1: Serial on Right Sensor cable (short wired cable) - recommended, since the USART3 pins are 5V tolerant.
 //   #define CONTROL_SERIAL_USART3
@@ -28,10 +30,14 @@
 #define START_FRAME         0xABCD     	// [-] Start frme definition for reliable serial communication
 #define TIME_SEND           100         // [ms] Sending time interval
 #define SPEED_MAX_TEST      300         // [-] Maximum speed for testing
+#define SPEED_STEP          20          // [-] Speed step
 // #define DEBUG_RX                        // [-] Debug received data. Prints all bytes to serial (comment-out to disable)
 
 #include <SoftwareSerial.h>
-SoftwareSerial HoverSerial(2,3);        // RX, TX
+//SoftwareSerial HoverSerial(1,3);        // RX, TX
+SoftwareSerial HoverSerial(D2,3);        // RX, TX
+//SoftwareSerial HoverSerial(D3,3);        // RX, TX
+
 
 // Global variables
 uint8_t idx = 0;                        // Index for new data pointer
@@ -62,6 +68,72 @@ typedef struct{
 SerialFeedback Feedback;
 SerialFeedback NewFeedback;
 
+
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+
+uint8_t broadcast[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; 
+int batVoltage;
+
+typedef struct message {
+  int speed;
+  int steer;
+} message;
+message msg;
+
+typedef struct message_bat {
+  int voltage;
+} message_bat;
+
+message_bat msg_bat;
+void onDataReceiver(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
+  //digitalWrite(LED_BUILTIN, LOW);
+  //Serial.println("Message received.");
+  // We don't use mac to verify the sender
+  // Let us transform the incomingData into our message structure
+  memcpy(&msg, incomingData, sizeof(msg));
+  /*Serial.print("speed:");
+  Serial.println(msg.speed); 
+  Serial.print("steer:");
+  Serial.println(msg.steer);*/
+  Send(msg.steer, msg.speed);
+  //digitalWrite(LED_BUILTIN, HIGH);
+}
+
+void setup_esp_now() {
+  WiFi.disconnect();
+  ESP.eraseConfig();
+
+  // Wifi STA Mode
+  WiFi.mode(WIFI_STA);
+  // Get Mac Add
+  //Serial.print("Mac Address: ");
+  //Serial.print(WiFi.macAddress());
+  //Serial.println("\nESP-Now Receiver");
+
+  // Initializing the ESP-NOW
+  if (esp_now_init() != 0) {
+    //Serial.println("Problem during ESP-NOW init");
+    return;
+  }
+
+  //esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+  // We can register the receiver callback function
+  esp_now_register_recv_cb(onDataReceiver);
+
+  /*memcpy(peer1.peer_addr, broadcast, 6);
+  peer1.channel = 0;
+  peer1.encrypt = 0;
+  // Register the peer
+  Serial.println("Registering a peer 1");
+  if ( esp_now_add_peer(&peer1) == ESP_OK) {
+    Serial.println("Peer 1 added");
+  }*/
+  esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+  esp_now_add_peer(broadcast, ESP_NOW_ROLE_COMBO, 0, NULL, 0);
+}
+
+
 // ########################## SETUP ##########################
 void setup() 
 {
@@ -70,6 +142,9 @@ void setup()
 
   HoverSerial.begin(HOVER_SERIAL_BAUD);
   pinMode(LED_BUILTIN, OUTPUT);
+  setup_esp_now();
+
+  digitalWrite(LED_BUILTIN, LOW);
 }
 
 // ########################## SEND ##########################
@@ -90,6 +165,7 @@ void Receive()
 {
     // Check for new data availability in the Serial buffer
     if (HoverSerial.available()) {
+      digitalWrite(LED_BUILTIN, HIGH);
         incomingByte 	  = HoverSerial.read();                                   // Read the incoming byte
         bufStartFrame	= ((uint16_t)(incomingByte) << 8) | incomingBytePrev;       // Construct the start frame
     }
@@ -126,18 +202,21 @@ void Receive()
             memcpy(&Feedback, &NewFeedback, sizeof(SerialFeedback));
 
             // Print data to built-in Serial
-            Serial.print("1: ");   Serial.print(Feedback.cmd1);
-            Serial.print(" 2: ");  Serial.print(Feedback.cmd2);
-            Serial.print(" 3: ");  Serial.print(Feedback.speedR_meas);
-            Serial.print(" 4: ");  Serial.print(Feedback.speedL_meas);
-            Serial.print(" 5: ");  Serial.print(Feedback.batVoltage);
-            Serial.print(" 6: ");  Serial.print(Feedback.boardTemp);
-            Serial.print(" 7: ");  Serial.println(Feedback.cmdLed);
+            //Serial.print("1: ");   Serial.print(Feedback.cmd1);
+            //Serial.print(" 2: ");  Serial.print(Feedback.cmd2);
+            //Serial.print(" 3: ");  Serial.print(Feedback.speedR_meas);
+            //Serial.print(" 4: ");  Serial.print(Feedback.speedL_meas);
+            //Serial.print(" 5: ");  
+            //Serial.println(Feedback.batVoltage);
+            //Serial.print(" 6: ");  Serial.print(Feedback.boardTemp);
+            //Serial.print(" 7: ");  Serial.println(Feedback.cmdLed);
+            batVoltage = Feedback.batVoltage;
         } else {
           Serial.println("Non-valid data skipped");
         }
         idx = 0;    // Reset the index (it prevents to enter in this if condition in the next cycle)
     }
+    batVoltage = Feedback.batVoltage;
 
     // Update previous states
     incomingBytePrev = incomingByte;
@@ -145,28 +224,40 @@ void Receive()
 
 // ########################## LOOP ##########################
 
-unsigned long iTimeSend = 0;
-int iTestMax = SPEED_MAX_TEST;
-int iTest = 0;
+
+unsigned long timeLast;
 
 void loop(void)
 { 
-  unsigned long timeNow = millis();
-
+  
+  
   // Check for new received data
   Receive();
 
+
+  unsigned long timeNow = millis();
+  if (timeNow > timeLast+100*10) {
+    timeLast = timeNow;
+    msg_bat.voltage = batVoltage;
+    esp_now_send(broadcast, (uint8_t *) &msg_bat, sizeof(msg_bat));
+  }
+
   // Send commands
-  if (iTimeSend > timeNow) return;
+  /*if (iTimeSend > timeNow) return;
   iTimeSend = timeNow + TIME_SEND;
-  Send(0, SPEED_MAX_TEST - 2*abs(iTest));
+  //Send(iTest, iTest);
+  msg_bat.voltage = 10;
+  esp_now_send(broadcast, (uint8_t *) &msg_bat, sizeof(msg_bat));
 
   // Calculate test command signal
-  iTest += 10;
-  if (iTest > iTestMax) iTest = -iTestMax;
+  iTest += iStep;
+
+  // invert step if reaching limit
+  if (iTest >= SPEED_MAX_TEST || iTest <= -SPEED_MAX_TEST)
+    iStep = -iStep;*/
 
   // Blink the LED
-  digitalWrite(LED_BUILTIN, (timeNow%2000)<1000);
+  //digitalWrite(LED_BUILTIN, (timeNow%2000)<1000);
 }
 
 // ########################## END ##########################
